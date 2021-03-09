@@ -22,8 +22,8 @@ type MLflow struct {
 const (
 	MLflowDeploymentID = "mlflow"
 	mlflowNamespace    = "carrier-workloads"
-	mlflowVersion      = "0.0.1"
-	mlflowChartFile    = "mlflow-0.0.1.tgz"
+	mlflowVersion      = "0.0.2"
+	mlflowChartFile    = "mlflow-0.0.2.tgz"
 )
 
 func (k *MLflow) ID() string {

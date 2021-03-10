@@ -37,6 +37,97 @@ var (
 	// StagingEventListenerURL should not exist
 	// TODO: detect this based on namespaces and services
 	StagingEventListenerURL = "http://el-mlflow-listener.carrier-workloads:8080"
+
+	// various templates for app deployments
+	applicationTemplates = map[string]string{
+		// serving mlflow model via mlflow
+		"serve-mlflow.yaml": `
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: "{{ .Org }}-{{ .AppName }}"
+  labels:
+    fluo/app-name: "{{ .AppName }}"
+    fluo/org: "{{ .Org }}"
+    fluo/app-guid: "{{ .Org }}.{{ .AppName }}"
+spec:
+  template:
+    metadata:
+      labels:
+        fluo/app-guid: "{{ .Org }}.{{ .AppName }}"
+    spec:
+      serviceAccountName: ` + deployments.WorkloadsDeploymentID + `
+      containers:
+        - name: "{{ .AppName }}"
+          image: "127.0.0.1:30500/apps/{{ .AppName }}@#IMAGE_SHA#"
+          command:
+            - bash
+          args:
+            - -c
+            - |
+              mlflow models serve --no-conda -h 0.0.0.0 -p 8080 -m #MODEL_URI#
+          ports:
+            - containerPort: 8080
+          env:
+            - name: MLFLOW_TRACKING_URI
+              value: "http://mlflow/"
+            - name: MLFLOW_S3_ENDPOINT_URL
+              value: "http://mlflow-minio:9000/"
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  key: accesskey
+                  name: mlflow-minio
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  key: secretkey
+                  name: mlflow-minio
+`,
+
+		// templates for serving via one of seldon servers
+		"serve-seldon.yaml": `
+apiVersion: v1
+kind: Secret
+metadata:
+  name: "{{ .Org }}-{{ .AppName }}-init-container-secret"
+  labels:
+    fluo/app-name: "{{ .AppName }}"
+    fluo/org: "{{ .Org }}"
+    fluo/app-guid: "{{ .Org }}.{{ .AppName }}"
+type: Opaque
+stringData:
+  AWS_ACCESS_KEY_ID: #ACCESS_KEY#
+  AWS_SECRET_ACCESS_KEY: #SECRET_KEY#
+  AWS_ENDPOINT_URL: http://mlflow-minio:9000/
+  USE_SSL: "false"
+---
+apiVersion: machinelearning.seldon.io/v1alpha2
+kind: SeldonDeployment
+metadata:
+  name: "{{ .Org }}-{{ .AppName }}"
+  labels:
+    fluo/app-name: "{{ .AppName }}"
+    fluo/org: "{{ .Org }}"
+    fluo/app-guid: "{{ .Org }}.{{ .AppName }}"
+spec:
+  name: "{{ .Org }}-{{ .AppName }}"
+  predictors:
+  - spec:
+    labels:
+      fluo/app-name: "{{ .AppName }}"
+      fluo/org: "{{ .Org }}"
+      fluo/app-guid: "{{ .Org }}.{{ .AppName }}"
+    graph:
+      children: []
+      implementation: #SELDON_SERVER#
+      modelUri: #MODEL_URI#
+      envSecretRefName: "{{ .Org }}-{{ .AppName }}-init-container-secret"
+      name: classifier
+    name: "{{ .Org }}-{{ .AppName }}-mlflow-dag"
+    replicas: 1
+`,
+	}
 )
 
 // CarrierClient provides functionality for talking to a
@@ -229,6 +320,8 @@ func (c *CarrierClient) Delete(app string) error {
 
 	c.ui.Normal().Msg("Deleted app code repository.")
 
+	// FIXME this needs to be application specific, SeldonDeployment + secret for seldon...
+
 	if c.kubeClient.HasIstio() {
 		details.Info("delete knative service")
 
@@ -240,7 +333,7 @@ func (c *CarrierClient) Delete(app string) error {
 		err = knc.ServingV1().Services(c.config.CarrierWorkloadsNamespace).
 			Delete(context.Background(), fmt.Sprintf("%s-%s", c.config.Org, app), metav1.DeleteOptions{})
 		if err != nil {
-			return errors.Wrap(err, "failed to knative service")
+			return errors.Wrap(err, "failed to delete knative service")
 		}
 	} else {
 
@@ -549,101 +642,31 @@ RUN conda env create -f /env/conda.yaml
 		return "", errors.Wrap(err, "failed to write fluo Dockerfile definition")
 	}
 
-	deploymentTmpl, err := template.New("deployment").Parse(`
-{{- if .HasIstio }}
-apiVersion: serving.knative.dev/v1
-kind: Service
-metadata:
-  name: "{{ .Org }}-{{ .AppName }}"
-  labels:
-    fluo/app-name: "{{ .AppName }}"
-    fluo/org: "{{ .Org }}"
-    fluo/app-guid: "{{ .Org }}.{{ .AppName }}"
-spec:
-  template:
-    metadata:
-      labels:
-        fluo/app-guid: "{{ .Org }}.{{ .AppName }}"
-{{- else }}
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: "{{ .Org }}-{{ .AppName }}"
-  labels:
-    carrier/app-guid:  "{{ .Org }}.{{ .AppName }}"
-    carrier/app-name: "{{ .AppName }}"
-    carrier/org: "{{ .Org }}"
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: "{{ .AppName }}"
-  template:
-    metadata:
-      labels:
-        app: "{{ .AppName }}"
-        fluo/app-guid: "{{ .Org }}.{{ .AppName }}"
-        # Needed for the ingress extension to work:
-        cloudfoundry.org/guid:  "{{ .Org }}.{{ .AppName }}"
-      annotations:
-        # Needed for the ingress extension to work:
-        cloudfoundry.org/routes: '[{ "hostname": "{{ .Route}}", "port": 8080 }]'
-        cloudfoundry.org/application_name:  "{{ .AppName }}"
-{{- end }}
-    spec:
-      serviceAccountName: ` + deployments.WorkloadsDeploymentID + `
-      containers:
-        - name: "{{ .AppName }}"
-          image: "127.0.0.1:30500/apps/{{ .AppName }}@#IMAGE_SHA#"
-          command:
-            - bash
-          args:
-            - -c
-            - |
-              model_uri="$(mlflow runs describe --run-id #RUN_ID# | grep -oEm1 's3.*artifacts')/model"
-              mlflow models serve --no-conda -h 0.0.0.0 -p 8080 -m ${model_uri}
-          ports:
-            - containerPort: 8080
-          env:
-            - name: MLFLOW_TRACKING_URI
-              value: "http://mlflow/"
-            - name: MLFLOW_S3_ENDPOINT_URL
-              value: "http://mlflow-minio:9000/"
-            - name: AWS_ACCESS_KEY_ID
-              valueFrom:
-                secretKeyRef:
-                  key: accesskey
-                  name: mlflow-minio
-            - name: AWS_SECRET_ACCESS_KEY
-              valueFrom:
-                secretKeyRef:
-                  key: secretkey
-                  name: mlflow-minio
-  `)
-	if err != nil {
-		return "", errors.Wrap(err, "failed to parse deployment template for app")
-	}
+	for filename, content := range applicationTemplates {
 
-	appFile, err := os.Create(filepath.Join(tmpDir, ".fluo", "serve.yaml"))
-	if err != nil {
-		return "", errors.Wrap(err, "failed to create file for kube resource definitions")
-	}
-	defer func() { err = appFile.Close() }()
+		deploymentTmpl, err := template.New("deployment").Parse(content)
+		if err != nil {
+			return "", errors.Wrap(err, "failed to parse deployment template '"+filename+"'")
+		}
 
-	err = deploymentTmpl.Execute(appFile, struct {
-		AppName  string
-		Route    string
-		Org      string
-		HasIstio bool
-	}{
-		AppName:  name,
-		Route:    route,
-		Org:      c.config.Org,
-		HasIstio: c.kubeClient.HasIstio(),
-	})
-	if err != nil {
-		return "", errors.Wrap(err, "failed to render kube resource definition")
+		appFile, err := os.Create(filepath.Join(tmpDir, ".fluo", filename))
+		if err != nil {
+			return "", errors.Wrap(err, "failed to create '"+filename+"' file for resource definitions")
+		}
+		defer func() { err = appFile.Close() }()
+
+		err = deploymentTmpl.Execute(appFile, struct {
+			AppName string
+			Route   string
+			Org     string
+		}{
+			AppName: name,
+			Route:   route,
+			Org:     c.config.Org,
+		})
+		if err != nil {
+			return "", errors.Wrap(err, "failed to render kube resource definition")
+		}
 	}
 
 	return

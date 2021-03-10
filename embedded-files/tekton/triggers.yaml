@@ -148,8 +148,12 @@ spec:
     params:
     - name: IMAGE-SHA
       value: $(tasks.build.results.IMAGE-DIGEST)
-    - name: RUN-ID
-      value: $(tasks.train.results.RUN-ID)
+    - name: MODEL-URI
+      value: $(tasks.train.results.MODEL-URI)
+    - name: SERVE-METHOD
+      value: "mlflow"
+    - name: SELDON-SERVER
+      value: "MLFLOW_SERVER"
     workspaces:
     - name: source
       workspace: source
@@ -193,12 +197,16 @@ spec:
   results:
   - name: RUN-ID
     description: ID of the training execution.
+  - name: MODEL-URI
+    description: Path to trained model
   steps:
   - name: run
     image: $(params.IMAGE)
     workingDir: "/workspace/source/app"
     script: |
       mlflow run --no-conda --experiment-name $(params.EXPERIMENT_NAME) . 2>&1 | tee train.log
+      RUNID=$(grep -oEm1 '[a-f0-9]{32}' train.log | tr -d '\n')
+      echo -n $(mlflow runs describe --run-id $RUNID | grep -oEm1 's3.*artifacts')/model | tee $(results.MODEL-URI.path)
     env:
     - name: MLFLOW_TRACKING_URI
       value: "http://mlflow"
@@ -229,7 +237,11 @@ metadata:
 spec:
   params:
   - name: IMAGE-SHA
-  - name: RUN-ID
+  - name: MODEL-URI
+  - name: SERVE-METHOD
+    default: "mlflow"
+  - name: SELDON-SERVER
+    default: "MLFLOW_SERVER"
   workspaces:
   - name: source
   steps:
@@ -237,4 +249,23 @@ spec:
     image: lachlanevenson/k8s-kubectl
     workingDir: "/workspace/source/app"
     script: |
-      sed "s/#RUN_ID#/$(params.RUN-ID)/g; s/#IMAGE_SHA#/$(params.IMAGE-SHA)/g" .fluo/serve.yaml | kubectl apply -f -
+      case "$(params.SERVE-METHOD)" in
+        "mlflow")
+          sed "s/#IMAGE_SHA#/$(params.IMAGE-SHA)/g; s|#MODEL_URI#|$(params.MODEL-URI)|g" .fluo/serve-mlflow.yaml | kubectl apply -f -
+        ;;
+        "seldon")
+          sed "s/#ACCESS_KEY#/$AWS_ACCESS_KEY_ID/; s/#SECRET_KEY#/$AWS_SECRET_ACCESS_KEY/; s/#SELDON_SERVER#/$(params.SELDON-SERVER)/; s|#MODEL_URI#|$(params.MODEL-URI)|" \
+              .fluo/serve-seldon.yaml | kubectl apply -f -
+          ;;
+      esac
+    env:
+    - name: AWS_ACCESS_KEY_ID
+      valueFrom:
+        secretKeyRef:
+          name: mlflow-minio
+          key: accesskey
+    - name: AWS_SECRET_ACCESS_KEY
+      valueFrom:
+        secretKeyRef:
+          name: mlflow-minio
+          key: secretkey

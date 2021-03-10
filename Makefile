@@ -97,6 +97,9 @@ istio-install:
 knative-install: istio-install
 	@./scripts/knative-install.sh
 
+seldon-install: istio-install
+	@./scripts/seldon-operator-install.sh
+
 ########################################################################
 # Kube dev environments
 
